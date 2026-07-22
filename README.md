@@ -53,17 +53,37 @@ tgpost check
 # public at  https://t.me/yourchannel
 ```
 
+## Configuration file (optional)
+
+Instead of exporting variables every time, put a `.tgpost.toml` in the project folder
+or in your home directory:
+
+```toml
+[tgpost]
+token = "123456:ABC-DEF..."
+chat  = ["@yourchannel", "@yourbackupchannel"]
+```
+
+Precedence is: command-line flag → environment variable → config file.
+
 ## Usage
 
 ```bash
 # send now
 tgpost send post.md
 
+# send the same post to several channels
+tgpost --chat @first --chat @second send post.md
+tgpost --chat "@first,@second" send post.md
+
 # see exactly what would be sent, without sending
 tgpost send post.md --dry-run
 
 # attach media (repeat --media for more than one)
 tgpost send post.md --media cover.jpg --media clip.mp4
+
+# send 2-10 attachments as a single album
+tgpost send post.md --media a.jpg --media b.jpg --media c.jpg --album
 
 # no notification sound, no link preview
 tgpost send post.md --silent --no-preview
@@ -116,6 +136,10 @@ bot.send_message("@yourchannel", to_telegram_html("# Hello\n\nFrom **Python**.")
   already reached Telegram must never be sent twice.
 - Messages longer than 4096 characters are split between paragraphs, so a formatting
   tag is never cut in half.
+- When posting to several channels, a failure on one channel is reported and the rest
+  still go out.
+- An album must contain between 2 and 10 files; only the first one carries the caption,
+  which is how Telegram renders albums.
 
 ## Tests
 

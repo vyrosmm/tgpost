@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import os
 import re
 import sys
 import time
 from pathlib import Path
 
+from . import config as cfg
 from .api import Bot, TelegramError, message_link
 from .markdown import split_message, to_telegram_html
 
@@ -21,32 +21,32 @@ _MEDIA_SUFFIXES = {
 }
 
 
-def _env(*names: str) -> str:
-    for name in names:
-        value = os.environ.get(name, "").strip()
-        if value:
-            return value
-    return ""
-
-
 def _resolve_token(args: argparse.Namespace) -> str:
-    token = args.token or _env("TGPOST_TOKEN", "TELEGRAM_BOT_TOKEN")
+    token = cfg.resolve("token", args.token) or cfg.resolve("bot_token")
     if not token:
         raise SystemExit(
-            "No bot token. Pass --token or set TGPOST_TOKEN.\n"
+            "No bot token. Pass --token, set TGPOST_TOKEN, or put it in .tgpost.toml.\n"
             "Create a bot with @BotFather to get one."
         )
     return token
 
 
-def _resolve_chat(args: argparse.Namespace) -> str:
-    chat = args.chat or _env("TGPOST_CHAT", "TELEGRAM_CHAT_ID")
-    if not chat:
+def _resolve_chats(args: argparse.Namespace) -> list[str]:
+    """One or more target chats. Repeat --chat, or comma-separate them."""
+    given = getattr(args, "chat", None)
+    raw: list[str] = []
+    for value in (given if isinstance(given, list) else [given]):
+        if value:
+            raw.extend(str(value).split(","))
+    if not raw:
+        raw = cfg.resolve("chat").split(",")
+    chats = [c.strip() for c in raw if c and c.strip()]
+    if not chats:
         raise SystemExit(
-            "No target chat. Pass --chat @yourchannel or set TGPOST_CHAT.\n"
-            "Remember to add the bot to the channel as an administrator."
+            "No target chat. Pass --chat @yourchannel, set TGPOST_CHAT, or add it to\n"
+            ".tgpost.toml. Remember to add the bot to the channel as an administrator."
         )
-    return chat
+    return chats
 
 
 def _read_source(source: str) -> str:
@@ -83,15 +83,17 @@ def _parse_when(value: str) -> dt.datetime:
     return today if today > dt.datetime.now() else today + dt.timedelta(days=1)
 
 
-def _send_document(bot: Bot, chat: str, text: str, *, preview: bool,
-                   silent: bool, media: list[str], dry_run: bool) -> list[dict]:
+def _send_document(bot: Bot, chat: str, text: str, *, preview: bool, silent: bool,
+                   media: list[str], dry_run: bool, album: bool = False) -> list[dict]:
     html = to_telegram_html(text)
     chunks = split_message(html)
     if not chunks and not media:
         raise SystemExit("Nothing to send: the document is empty.")
 
     if dry_run:
-        print(f"--- dry run: {len(chunks)} message(s), {len(media)} attachment(s) ---")
+        mode = "album" if album and len(media) > 1 else "separate"
+        print(f"--- dry run [{chat}]: {len(chunks)} message(s), "
+              f"{len(media)} attachment(s), {mode} ---")
         for index, chunk in enumerate(chunks, 1):
             print(f"\n[message {index}, {len(chunk)} chars]\n{chunk}")
         for item in media:
@@ -106,6 +108,10 @@ def _send_document(bot: Bot, chat: str, text: str, *, preview: bool,
             time.sleep(1)  # stay well inside Telegram's per-chat rate limit
 
     caption = "" if chunks else to_telegram_html(text)[:1024]
+    if album and 2 <= len(media) <= 10:
+        results.extend(bot.send_media_group(chat, media, caption, silent=silent))
+        return results
+
     for item in media:
         suffix = Path(item).suffix.lower()
         kind = _MEDIA_SUFFIXES.get(suffix, "document")
@@ -131,13 +137,23 @@ def _report(bot: Bot, chat_id: str, results: list[dict]) -> None:
 
 def _cmd_send(args: argparse.Namespace) -> int:
     bot = Bot(_resolve_token(args))
-    chat = _resolve_chat(args)
+    chats = _resolve_chats(args)
     text = _read_source(args.source)
-    results = _send_document(bot, chat, text, preview=not args.no_preview,
-                             silent=args.silent, media=args.media or [],
-                             dry_run=args.dry_run)
-    _report(bot, chat, results)
-    return 0
+    failures = 0
+    for index, chat in enumerate(chats):
+        try:
+            results = _send_document(bot, chat, text, preview=not args.no_preview,
+                                     silent=args.silent, media=args.media or [],
+                                     dry_run=args.dry_run,
+                                     album=getattr(args, "album", False))
+            _report(bot, chat, results)
+        except TelegramError as exc:
+            # One bad channel must not stop the rest.
+            failures += 1
+            print(f"{chat}: {exc}", file=sys.stderr)
+        if index + 1 < len(chats):
+            time.sleep(2)
+    return 1 if failures == len(chats) else 0
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -160,14 +176,20 @@ def _cmd_check(args: argparse.Namespace) -> int:
     bot = Bot(_resolve_token(args))
     me = bot.get_me()
     print(f"bot        @{me.get('username')}  (id {me.get('id')})")
-    chat_id = args.chat or _env("TGPOST_CHAT", "TELEGRAM_CHAT_ID")
-    if not chat_id:
+    try:
+        chats = _resolve_chats(args)
+    except SystemExit:
         print("chat       (not set — pass --chat to verify posting rights)")
         return 0
-    chat = bot.get_chat(chat_id)
-    print(f"chat       {chat.get('title')}  ({chat.get('type')})")
-    username = chat.get("username")
-    print(f"public at  https://t.me/{username}" if username else "public at  (private chat)")
+    for chat_id in chats:
+        try:
+            chat = bot.get_chat(chat_id)
+        except TelegramError as exc:
+            print(f"chat       {chat_id}: {exc}")
+            continue
+        username = chat.get("username")
+        where = f"https://t.me/{username}" if username else "(private chat)"
+        print(f"chat       {chat.get('title')}  ({chat.get('type')})  {where}")
     return 0
 
 
@@ -177,7 +199,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Post Markdown files to a Telegram channel. No dependencies.",
     )
     parser.add_argument("--token", help="bot token (default: $TGPOST_TOKEN)")
-    parser.add_argument("--chat", help="@channel or numeric id (default: $TGPOST_CHAT)")
+    parser.add_argument("--chat", action="append",
+                        help="@channel or numeric id; repeat or comma-separate for several "
+                             "(default: $TGPOST_CHAT or .tgpost.toml)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     send = sub.add_parser("send", help="send a Markdown file now")
@@ -186,6 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="attach a photo/video/document (repeatable)")
     send.add_argument("--silent", action="store_true", help="send without a notification")
     send.add_argument("--no-preview", action="store_true", help="disable link previews")
+    send.add_argument("--album", action="store_true",
+                      help="send 2-10 attachments as one album instead of separately")
     send.add_argument("--dry-run", action="store_true",
                       help="render and print, without sending")
     send.set_defaults(func=_cmd_send)
@@ -197,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument("--media", action="append", metavar="FILE")
     schedule.add_argument("--silent", action="store_true")
     schedule.add_argument("--no-preview", action="store_true")
+    schedule.add_argument("--album", action="store_true")
     schedule.add_argument("--dry-run", action="store_true")
     schedule.set_defaults(func=_cmd_schedule)
 

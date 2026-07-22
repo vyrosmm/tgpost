@@ -185,6 +185,41 @@ class Bot:
                            caption=caption or None, parse_mode="HTML",
                            disable_notification="true" if silent else None)
 
+    def send_media_group(self, chat: str, paths: list[str | os.PathLike[str]],
+                         caption: str = "", *, silent: bool = False) -> list[dict[str, Any]]:
+        """Send 2-10 photos/videos as a single album.
+
+        Telegram takes the album as one JSON `media` array plus the files themselves;
+        each entry points at its file with an ``attach://name`` reference. Only the
+        first item carries the caption, otherwise the text repeats under every photo.
+        """
+        items = [Path(p) for p in paths]
+        if not 2 <= len(items) <= 10:
+            raise TelegramError("An album needs between 2 and 10 files.")
+
+        media, files = [], []
+        for index, item in enumerate(items):
+            if not item.exists():
+                raise TelegramError(f"File not found: {item}")
+            field = f"file{index}"
+            kind = "video" if item.suffix.lower() in {".mp4", ".mov", ".m4v"} else "photo"
+            entry: dict[str, Any] = {"type": kind, "media": f"attach://{field}"}
+            if index == 0 and caption:
+                entry["caption"] = caption[:1024]
+                entry["parse_mode"] = "HTML"
+            media.append(entry)
+            files.append((field, item.name, item.read_bytes()))
+
+        fields: dict[str, Any] = {"chat_id": chat, "media": json.dumps(media)}
+        if silent:
+            fields["disable_notification"] = "true"
+        ctype, body = _multipart(fields, files)
+        request = urllib.request.Request(
+            f"{API_ROOT}/bot{self.token}/sendMediaGroup",
+            data=body, method="POST", headers={"Content-Type": ctype},
+        )
+        return self._request("sendMediaGroup", request)
+
 
 def message_link(chat: dict[str, Any], message_id: int) -> str:
     """Public t.me link for a message, when the chat has a username."""
